@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stemsurf"
+version = "0.1.0"
+description = "AI stem-separation + auto-mix engine: separates a track into stems, spaces them in the stereo field, balances loudness, and restores clarity to muffled stems."
+readme = "README.md"
+requires-python = ">=3.8,<3.11"  # Spleeter/TensorFlow constraint
+license = { text = "MIT" }
+
+dependencies = [
+    "numpy>=1.21,<2",
+    "scipy>=1.7",
+    "soundfile>=0.12",
+    "pyloudnorm>=0.4",
+    "spleeter>=2.4",
+    "click>=8.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+stemsurf = "stemsurf.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["stemsurf*"]
