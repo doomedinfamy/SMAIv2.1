@@ -1,12 +1,4 @@
-"""Per-stem mix profiles: where each stem sits in the stereo field and
-which frequency pocket it owns.
 
-pan: -1.0 (hard left) .. 0.0 (center) .. +1.0 (hard right)
-width: 0.0 (mono) .. 1.0 (unchanged) .. 2.0 (extra wide)
-pocket: (low_hz, high_hz) — the band this stem should dominate.
-carve_db: how much competing stems are dipped inside this stem's pocket.
-target_lufs_offset: dB relative to the mix anchor (vocals = 0).
-"""
 
 from dataclasses import dataclass, field
 from typing import Dict, Tuple
