@@ -1,4 +1,4 @@
-"""Per-stem analysis: loudness, spectral balance, muffle detection."""
+
 
 from dataclasses import dataclass
 
