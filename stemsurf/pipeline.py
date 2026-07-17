@@ -1,8 +1,4 @@
-"""MixPipeline — the engine core.
 
-    separate -> analyze -> carve pockets -> de-muffle -> space -> balance
-    -> mixdown -> normalize -> limit
-"""
 
 import os
 from typing import Dict, Optional
