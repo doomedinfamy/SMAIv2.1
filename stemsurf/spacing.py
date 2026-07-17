@@ -1,4 +1,4 @@
-"""Stereo spacing: places each stem in the stereo field per its profile."""
+
 
 import numpy as np
 
