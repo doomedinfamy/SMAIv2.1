@@ -1,8 +1,4 @@
-"""Stem separation engines.
 
-SpleeterEngine is the default. The base class keeps the interface
-pluggable so Demucs (or anything else) can be dropped in later.
-"""
 
 import os
 from abc import ABC, abstractmethod
