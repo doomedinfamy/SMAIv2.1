@@ -1,10 +1,4 @@
-"""stemsurf CLI.
 
-Examples:
-    stemsurf song.mp3
-    stemsurf song.mp3 -o mixes/ --model spleeter:5stems --lufs -12
-    stemsurf song.mp3 --stems-dir my_daw_stems/   # skip separation
-"""
 
 import click
 
