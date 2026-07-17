@@ -1,0 +1,676 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SLICR — sampler terminal</title>
+<style>
+  :root { --bg:#0a0e0a; --fg:#33ff66; --dim:#1d8f43; --warn:#ffcc33; --err:#ff5555; --cyan:#33ddff; --mag:#ff66dd; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  html,body { height:100%; }
+  body {
+    background:var(--bg); color:var(--fg);
+    font-family:"Cascadia Mono","Consolas","Menlo",monospace;
+    font-size:14px; line-height:1.45;
+    display:flex; flex-direction:column;
+  }
+  body::after { /* scanlines */
+    content:""; pointer-events:none; position:fixed; inset:0;
+    background:repeating-linear-gradient(0deg, rgba(0,0,0,.13) 0 1px, transparent 1px 3px);
+  }
+  #term { flex:1; overflow-y:auto; padding:14px 16px 4px; white-space:pre-wrap; word-break:break-word; }
+  #inline { display:flex; padding:4px 16px 12px; }
+  #prompt { color:var(--cyan); margin-right:8px; }
+  #cmd {
+    flex:1; background:transparent; border:none; outline:none;
+    color:var(--fg); font:inherit; caret-color:var(--fg);
+  }
+  .dim  { color:var(--dim); }
+  .warn { color:var(--warn); }
+  .err  { color:var(--err); }
+  .cyan { color:var(--cyan); }
+  .mag  { color:var(--mag); }
+  #drop {
+    position:fixed; inset:0; display:none; align-items:center; justify-content:center;
+    background:rgba(10,14,10,.9); color:var(--cyan); font-size:22px; z-index:10;
+    border:2px dashed var(--cyan);
+  }
+  ::selection { background:var(--dim); color:#000; }
+  #term::-webkit-scrollbar { width:8px; }
+  #term::-webkit-scrollbar-thumb { background:var(--dim); }
+</style>
+</head>
+<body>
+<div id="term"></div>
+<div id="inline"><span id="prompt">slicr&gt;</span><input id="cmd" autocomplete="off" spellcheck="false" autofocus></div>
+<div id="drop">DROP AUDIO FILE</div>
+<input type="file" id="file" accept="audio/*" style="display:none">
+<script>
+"use strict";
+/* ============================== state ============================== */
+let actx = null, master = null;
+let buffer = null, fileName = "";
+let bpm = 0, segBeats = 4;
+let segs = [];              // {start, end, fx:{rev, comp, thr, ratio, semis}}
+let playing = [];           // active one-shot source nodes
+let chans = {};             // looper channels: segIndex -> {src, t0, dur}
+let seqTimer = null;
+
+const NOTE = {C:0,"C#":1,DB:1,D:2,"D#":3,EB:3,E:4,F:5,"F#":6,GB:6,G:7,"G#":8,AB:8,A:9,"A#":10,BB:10,B:11};
+const BLOCKS = "▁▂▃▄▅▆▇█";
+
+/* ============================== terminal ============================== */
+const term = document.getElementById("term");
+const input = document.getElementById("cmd");
+const drop = document.getElementById("drop");
+const filePick = document.getElementById("file");
+let history = [], hIdx = -1;
+
+function print(txt, cls) {
+  const d = document.createElement("div");
+  if (cls) d.className = cls;
+  d.textContent = txt;
+  term.appendChild(d);
+  term.scrollTop = term.scrollHeight;
+}
+function banner() {
+  print("  ███ █   █ ███ ███", "cyan");
+  print("  █   █   █ █   █ █   S L I C R  v1.0", "cyan");
+  print("  ███ ███ █ ███ █ █   bpm-sliced sampler terminal", "cyan");
+  print("");
+  print("drop an audio file anywhere, or type: load", "dim");
+  print("type 'help' for commands", "dim");
+  print("");
+}
+
+input.addEventListener("keydown", e => {
+  if (e.key === "Enter") {
+    const line = input.value.trim();
+    input.value = "";
+    if (!line) return;
+    history.push(line); hIdx = history.length;
+    print("slicr> " + line, "dim");
+    exec(line);
+  } else if (e.key === "ArrowUp") {
+    if (hIdx > 0) { hIdx--; input.value = history[hIdx]; e.preventDefault(); }
+  } else if (e.key === "ArrowDown") {
+    if (hIdx < history.length - 1) { hIdx++; input.value = history[hIdx]; }
+    else { hIdx = history.length; input.value = ""; }
+  }
+});
+document.body.addEventListener("click", () => input.focus());
+
+/* drag & drop */
+window.addEventListener("dragover", e => { e.preventDefault(); drop.style.display = "flex"; });
+drop.addEventListener("dragleave", () => drop.style.display = "none");
+window.addEventListener("drop", e => {
+  e.preventDefault(); drop.style.display = "none";
+  if (e.dataTransfer.files.length) loadFile(e.dataTransfer.files[0]);
+});
+filePick.addEventListener("change", () => { if (filePick.files.length) loadFile(filePick.files[0]); });
+
+/* ============================== audio setup ============================== */
+function ensureCtx() {
+  if (!actx) {
+    actx = new (window.AudioContext || window.webkitAudioContext)();
+    master = actx.createGain();
+    master.gain.value = 0.9;
+    master.connect(actx.destination);
+  }
+  if (actx.state === "suspended") actx.resume();
+}
+
+async function loadFile(f) {
+  ensureCtx();
+  fileName = f.name;
+  print("decoding " + f.name + " ...");
+  try {
+    const ab = await f.arrayBuffer();
+    buffer = await actx.decodeAudioData(ab);
+  } catch (err) {
+    print("decode failed: " + err.message, "err");
+    return;
+  }
+  print("loaded  " + fileName + "  (" + buffer.duration.toFixed(2) + "s, " +
+        buffer.numberOfChannels + "ch, " + buffer.sampleRate + "Hz)");
+  print("analyzing bpm ...");
+  const t = await detectBPM(buffer);
+  if (t) {
+    bpm = t;
+    print("bpm detected: " + bpm, "cyan");
+  } else {
+    bpm = 120;
+    print("could not detect bpm reliably — defaulting to 120 (override with: bpm <n>)", "warn");
+  }
+  doSlice(segBeats);
+  print("");
+  print("try: list | play 1 | loop 2 | rev 1 0.5 | key 1 +3", "dim");
+}
+
+/* ============================== bpm detection ============================== */
+async function detectBPM(buf) {
+  try {
+    const off = new OfflineAudioContext(1, buf.length, buf.sampleRate);
+    const s = off.createBufferSource(); s.buffer = buf;
+    const lp = off.createBiquadFilter();
+    lp.type = "lowpass"; lp.frequency.value = 150; lp.Q.value = 1;
+    s.connect(lp); lp.connect(off.destination); s.start(0);
+    const r = await off.startRendering();
+    const d = r.getChannelData(0), sr = r.sampleRate;
+
+    let max = 0;
+    for (let i = 0; i < d.length; i++) { const v = Math.abs(d[i]); if (v > max) max = v; }
+    if (max === 0) return null;
+
+    // lower threshold until we have enough peaks
+    let peaks = [];
+    for (let thr = max * 0.85; thr > max * 0.2; thr -= max * 0.05) {
+      peaks = [];
+      for (let i = 0; i < d.length;) {
+        if (Math.abs(d[i]) > thr) { peaks.push(i); i += Math.floor(sr * 0.25); }
+        else i++;
+      }
+      if (peaks.length >= Math.max(20, r.duration * 1.5)) break;
+    }
+    if (peaks.length < 6) return null;
+
+    // histogram of tempo candidates from peak intervals
+    const counts = {};
+    for (let i = 0; i < peaks.length; i++) {
+      for (let j = i + 1; j < Math.min(i + 10, peaks.length); j++) {
+        let t = 60 / ((peaks[j] - peaks[i]) / sr);
+        while (t < 85) t *= 2;
+        while (t > 170) t /= 2;
+        const k = Math.round(t);
+        counts[k] = (counts[k] || 0) + 1;
+      }
+    }
+    // merge ±1 neighbours, pick winner
+    let best = 0, bc = 0;
+    for (const k in counts) {
+      const kk = +k;
+      const c = (counts[kk - 1] || 0) + counts[kk] + (counts[kk + 1] || 0);
+      if (c > bc) { bc = c; best = kk; }
+    }
+    return best || null;
+  } catch (e) { return null; }
+}
+
+/* ============================== slicing ============================== */
+function doSlice(beats) {
+  segBeats = beats;
+  const len = (60 / bpm) * beats;
+  segs = [];
+  for (let t = 0; t < buffer.duration - 0.05; t += len) {
+    segs.push({ start: t, end: Math.min(t + len, buffer.duration), fx: freshFx() });
+  }
+  print("sliced into " + segs.length + " segments of " + beats + " beat(s) (" + len.toFixed(2) + "s each) @ " + bpm + " bpm");
+}
+function freshFx() { return { rev: 0, comp: false, thr: -24, ratio: 6, semis: 0 }; }
+
+function fxTag(seg) {
+  const f = [];
+  if (seg.fx.semis) f.push("key" + (seg.fx.semis > 0 ? "+" : "") + seg.fx.semis);
+  if (seg.fx.rev) f.push("rev" + seg.fx.rev);
+  if (seg.fx.comp) f.push("comp");
+  return f.length ? "  [" + f.join(" ") + "]" : "";
+}
+
+/* ============================== fx chain ============================== */
+function makeImpulse(ctx, secs) {
+  const len = Math.floor(ctx.sampleRate * secs);
+  const ir = ctx.createBuffer(2, len, ctx.sampleRate);
+  for (let ch = 0; ch < 2; ch++) {
+    const d = ir.getChannelData(ch);
+    for (let i = 0; i < len; i++)
+      d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 2.5);
+  }
+  return ir;
+}
+
+function makeChain(ctx, seg) {
+  const inNode = ctx.createGain();
+  let node = inNode;
+  if (seg.fx.comp) {
+    const c = ctx.createDynamicsCompressor();
+    c.threshold.value = seg.fx.thr;
+    c.ratio.value = seg.fx.ratio;
+    c.knee.value = 10; c.attack.value = 0.003; c.release.value = 0.25;
+    node.connect(c); node = c;
+  }
+  const out = ctx.createGain();
+  if (seg.fx.rev > 0) {
+    const dry = ctx.createGain(), wet = ctx.createGain(), cv = ctx.createConvolver();
+    cv.buffer = makeImpulse(ctx, 2);
+    dry.gain.value = 1;
+    wet.gain.value = seg.fx.rev * 1.5;
+    node.connect(dry); dry.connect(out);
+    node.connect(cv); cv.connect(wet); wet.connect(out);
+  } else {
+    node.connect(out);
+  }
+  return { input: inNode, out: out };
+}
+
+/* ============================== playback ============================== */
+function stopAll(silent) {
+  playing.forEach(s => { try { s.onended = null; s.stop(); } catch (e) {} });
+  playing = [];
+  for (const k in chans) { try { chans[k].src.stop(); } catch (e) {} }
+  chans = {};
+  if (seqTimer) { clearTimeout(seqTimer); seqTimer = null; }
+  if (!silent) print("■ stopped (all channels off)");
+}
+
+/* ============================== looper channels ============================== */
+function chanOn(i) {
+  if (chans[i]) { print("ch " + (i + 1) + " is already looping", "warn"); return; }
+  const seg = segs[i];
+  const src = actx.createBufferSource();
+  src.buffer = buffer;
+  src.playbackRate.value = Math.pow(2, seg.fx.semis / 12);
+  const chain = makeChain(actx, seg);
+  src.connect(chain.input); chain.out.connect(master);
+  src.loop = true; src.loopStart = seg.start; src.loopEnd = seg.end;
+  const dur = (seg.end - seg.start) / src.playbackRate.value;
+  // quantize start to the loop cycle of the longest-running channel
+  let when = actx.currentTime;
+  const keys = Object.keys(chans);
+  if (keys.length) {
+    const m = chans[keys[0]];
+    const elapsed = actx.currentTime - m.t0;
+    if (elapsed > 0) {
+      const rem = m.dur - (elapsed % m.dur);
+      if (rem > 0.03 && rem < m.dur - 0.03) when = actx.currentTime + rem;
+    }
+  }
+  src.start(when, seg.start);
+  chans[i] = { src: src, t0: when, dur: dur };
+  const wait = when - actx.currentTime;
+  print("● ch " + (i + 1) + " loop ON" + (wait > 0.03 ? "  (synced — drops in " + wait.toFixed(2) + "s)" : "") + fxTag(seg), "mag");
+}
+function chanOff(i) {
+  if (!chans[i]) { print("ch " + (i + 1) + " is not running", "warn"); return; }
+  try { chans[i].src.stop(); } catch (e) {}
+  delete chans[i];
+  print("○ ch " + (i + 1) + " off");
+}
+function chanStatus() {
+  const keys = Object.keys(chans);
+  if (!keys.length) { print("no channels running", "dim"); return; }
+  print("running channels:", "cyan");
+  keys.forEach(k => {
+    const i = +k, seg = segs[i];
+    print("  ● ch " + (i + 1) + "  " + seg.start.toFixed(2) + "s → " + seg.end.toFixed(2) + "s  (" + chans[k].dur.toFixed(2) + "s cycle)" + fxTag(seg), "mag");
+  });
+}
+
+function playSeg(i, opts) {
+  opts = opts || {};
+  const seg = segs[i];
+  ensureCtx();
+  const src = actx.createBufferSource();
+  src.buffer = buffer;
+  src.playbackRate.value = Math.pow(2, seg.fx.semis / 12);
+  const chain = makeChain(actx, seg);
+  src.connect(chain.input);
+  chain.out.connect(master);
+  const dur = (seg.end - seg.start) / src.playbackRate.value;
+  if (opts.loop) {
+    src.loop = true; src.loopStart = seg.start; src.loopEnd = seg.end;
+    src.start(0, seg.start);
+    if (opts.times && isFinite(opts.times)) src.stop(actx.currentTime + dur * opts.times);
+    if (!opts.quiet) print("↻ looping seg " + (i + 1) + (isFinite(opts.times) ? " ×" + opts.times : " (until 'stop')") + fxTag(seg), "mag");
+  } else {
+    src.start(0, seg.start, seg.end - seg.start);
+    if (!opts.quiet) print("▶ seg " + (i + 1) + "  " + seg.start.toFixed(2) + "s → " + seg.end.toFixed(2) + "s" + fxTag(seg), "cyan");
+  }
+  playing.push(src);
+  if (opts.onended) src.onended = opts.onended;
+  return dur;
+}
+
+function playSequence(order) {
+  let idx = 0;
+  const next = () => {
+    if (idx >= order.length) { print("■ sequence done", "dim"); return; }
+    const i = order[idx++];
+    print("▶ seq [" + idx + "/" + order.length + "] seg " + (i + 1) + fxTag(segs[i]), "cyan");
+    const dur = playSeg(i, { quiet: true });
+    seqTimer = setTimeout(next, dur * 1000);
+  };
+  next();
+}
+
+/* ============================== ascii waveform ============================== */
+function wave(i) {
+  const seg = segs[i];
+  const d = buffer.getChannelData(0);
+  const sr = buffer.sampleRate;
+  const s0 = Math.floor(seg.start * sr), s1 = Math.floor(seg.end * sr);
+  const cols = 64, win = Math.max(1, Math.floor((s1 - s0) / cols));
+  let peak = 0;
+  const amps = [];
+  for (let c = 0; c < cols; c++) {
+    let m = 0;
+    const base = s0 + c * win;
+    for (let k = 0; k < win; k += 16) { const v = Math.abs(d[base + k] || 0); if (v > m) m = v; }
+    amps.push(m); if (m > peak) peak = m;
+  }
+  let line = "";
+  for (const a of amps)
+    line += BLOCKS[Math.min(7, Math.floor((peak ? a / peak : 0) * 7.99))];
+  print("seg " + (i + 1) + " |" + line + "|");
+}
+
+/* ============================== export wav ============================== */
+async function exportSeg(i) {
+  const seg = segs[i];
+  const rate = Math.pow(2, seg.fx.semis / 12);
+  const dur = (seg.end - seg.start) / rate + (seg.fx.rev > 0 ? 2 : 0.1);
+  const off = new OfflineAudioContext(2, Math.ceil(dur * buffer.sampleRate), buffer.sampleRate);
+  const src = off.createBufferSource();
+  src.buffer = buffer; src.playbackRate.value = rate;
+  const chain = makeChain(off, seg);
+  src.connect(chain.input); chain.out.connect(off.destination);
+  src.start(0, seg.start, seg.end - seg.start);
+  const rendered = await off.startRendering();
+  const blob = wavBlob(rendered);
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = (fileName.replace(/\.[^.]+$/, "") || "slice") + "_seg" + (i + 1) + ".wav";
+  a.click();
+  print("exported seg " + (i + 1) + " → " + a.download, "cyan");
+}
+
+function wavBlob(buf) {
+  const nCh = buf.numberOfChannels, len = buf.length, sr = buf.sampleRate;
+  const bytes = 44 + len * nCh * 2;
+  const ab = new ArrayBuffer(bytes), v = new DataView(ab);
+  const wstr = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  wstr(0, "RIFF"); v.setUint32(4, bytes - 8, true); wstr(8, "WAVE");
+  wstr(12, "fmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true);
+  v.setUint16(22, nCh, true); v.setUint32(24, sr, true);
+  v.setUint32(28, sr * nCh * 2, true); v.setUint16(32, nCh * 2, true); v.setUint16(34, 16, true);
+  wstr(36, "data"); v.setUint32(40, len * nCh * 2, true);
+  let o = 44;
+  for (let i = 0; i < len; i++)
+    for (let ch = 0; ch < nCh; ch++) {
+      let s = Math.max(-1, Math.min(1, buf.getChannelData(ch)[i]));
+      v.setInt16(o, s < 0 ? s * 0x8000 : s * 0x7FFF, true); o += 2;
+    }
+  return new Blob([ab], { type: "audio/wav" });
+}
+
+/* ============================== command helpers ============================== */
+function needBuf() {
+  if (!buffer) { print("no audio loaded — drop a file or type: load", "err"); return true; }
+  return false;
+}
+function segList(arg) { // "1+3+5" -> [0,2,4], or null on error
+  const out = [];
+  for (const part of arg.split("+")) {
+    const i = segIdx(part);
+    if (i < 0) return null;
+    out.push(i);
+  }
+  return out;
+}
+function segIdx(arg) {
+  const n = parseInt(arg, 10);
+  if (isNaN(n) || n < 1 || n > segs.length) {
+    print("bad segment number (1–" + segs.length + ")", "err");
+    return -1;
+  }
+  return n - 1;
+}
+function parseKey(arg) {
+  if (/^[+-]?\d+$/.test(arg)) return parseInt(arg, 10);
+  const up = arg.toUpperCase();
+  if (up in NOTE) {
+    let s = NOTE[up];
+    if (s > 6) s -= 12; // pick nearest direction from C
+    return s;
+  }
+  return null;
+}
+
+/* ============================== commands ============================== */
+const HELP = [
+  ["load",                 "open file picker (or drag & drop anywhere)"],
+  ["bpm [n]",              "show detected bpm, or override & re-slice"],
+  ["slice <beats>",        "re-slice into segments of n beats (e.g. slice 8)"],
+  ["list",                 "list all segments with fx"],
+  ["wave <n>",             "ascii waveform of segment n"],
+  ["play <n> | play all",  "play a segment / whole set in order"],
+  ["play <n+n+n>",         "play segments simultaneously, e.g. play 1+3+5"],
+  ["loop <n[+n]> [times]", "loop segment(s) together (forever, or n times)"],
+  ["on <n[+n]>",           "looper channel ON: seg loops alongside running chans (beat-synced)"],
+  ["off <n|all>",          "kill just that loop channel, others keep playing"],
+  ["status",               "show which loop channels are running"],
+  ["over [loop] <n[+n]>",  "layer segment(s) on top of what's already playing"],
+  ["seq <n n n ...>",      "play segments in custom order, e.g. seq 1 1 4 2"],
+  ["stop",                 "stop all playback"],
+  ["cut <n> <a> <b>",      "trim seg n to a–b sec (relative). 'cut <n>' deletes it"],
+  ["rev <n> [0-1]",        "add reverb to seg (amount, default 0.4). 0 removes"],
+  ["comp <n> [thr ratio]", "compress seg (default -24dB 6:1). 'comp <n> off' removes"],
+  ["key <n> <±semi|note>", "repitch seg: key 2 +3 | key 2 -5 | key 2 Eb (rel. to C)"],
+  ["reset <n|all>",        "clear fx on segment(s)"],
+  ["export <n>",           "render segment + fx to .wav download"],
+  ["clear",                "clear screen"],
+];
+
+function exec(line) {
+  const p = line.split(/\s+/);
+  const cmd = p[0].toLowerCase();
+  ensureCtx();
+
+  switch (cmd) {
+    case "help":
+      print("commands:", "cyan");
+      HELP.forEach(h => print("  " + h[0].padEnd(22) + h[1], "dim"));
+      break;
+
+    case "load":
+      filePick.click();
+      break;
+
+    case "bpm":
+      if (needBuf()) return;
+      if (p[1]) {
+        const n = parseFloat(p[1]);
+        if (!n || n < 30 || n > 300) { print("bpm must be 30–300", "err"); return; }
+        bpm = n;
+        print("bpm set to " + bpm, "cyan");
+        doSlice(segBeats);
+      } else print("bpm: " + bpm + "  (segments of " + segBeats + " beats)");
+      break;
+
+    case "slice":
+      if (needBuf()) return;
+      {
+        const b = parseFloat(p[1]);
+        if (!b || b <= 0) { print("usage: slice <beats>  e.g. slice 4", "err"); return; }
+        stopAll(true);
+        doSlice(b);
+      }
+      break;
+
+    case "list": case "ls": case "segs":
+      if (needBuf()) return;
+      print(fileName + "  @ " + bpm + " bpm  —  " + segs.length + " segments:");
+      segs.forEach((s, i) =>
+        print("  [" + String(i + 1).padStart(2) + "]  " + s.start.toFixed(2) + "s → " + s.end.toFixed(2) +
+              "s  (" + (s.end - s.start).toFixed(2) + "s)" + fxTag(s)));
+      break;
+
+    case "wave":
+      if (needBuf()) return;
+      { const i = segIdx(p[1]); if (i >= 0) wave(i); }
+      break;
+
+    case "play":
+      if (needBuf()) return;
+      stopAll(true);
+      if (p[1] === "all") { playSequence(segs.map((_, i) => i)); }
+      else {
+        const list = segList(p[1] || "1"); if (!list) return;
+        if (list.length > 1) print("▶ stacking segs " + list.map(x => x + 1).join("+"), "cyan");
+        list.forEach(i => playSeg(i, { quiet: list.length > 1 }));
+      }
+      break;
+
+    case "loop":
+      if (needBuf()) return;
+      {
+        const list = segList(p[1] || ""); if (!list) return;
+        stopAll(true);
+        const times = p[2] ? parseInt(p[2], 10) : Infinity;
+        if (list.length > 1) print("↻ loop-stacking segs " + list.map(x => x + 1).join("+") + (isFinite(times) ? " ×" + times : " (until 'stop')"), "mag");
+        list.forEach(i => playSeg(i, { loop: true, times: times, quiet: list.length > 1 }));
+      }
+      break;
+
+    case "on":
+      if (needBuf()) return;
+      {
+        const list = segList(p[1] || ""); if (!list) return;
+        list.forEach(i => chanOn(i));
+      }
+      break;
+
+    case "off":
+      if (needBuf()) return;
+      if (p[1] === "all") {
+        for (const k in chans) { try { chans[k].src.stop(); } catch (e) {} }
+        chans = {};
+        print("○ all channels off");
+      } else {
+        const list = segList(p[1] || ""); if (!list) return;
+        list.forEach(i => chanOff(i));
+      }
+      break;
+
+    case "status": case "chans":
+      if (needBuf()) return;
+      chanStatus();
+      break;
+
+    case "over": case "add":
+      if (needBuf()) return;
+      {
+        let a = p.slice(1), lp = false;
+        if (a[0] === "loop") { lp = true; a = a.slice(1); }
+        const list = segList(a[0] || ""); if (!list) return;
+        const times = a[1] ? parseInt(a[1], 10) : Infinity;
+        print("+ layering seg " + list.map(x => x + 1).join("+") + (lp ? " (looped)" : "") + " over current playback", "mag");
+        list.forEach(i => playSeg(i, lp ? { loop: true, times: times, quiet: true } : { quiet: true }));
+      }
+      break;
+
+    case "seq":
+      if (needBuf()) return;
+      {
+        const order = p.slice(1).map(x => parseInt(x, 10) - 1);
+        if (!order.length || order.some(x => isNaN(x) || x < 0 || x >= segs.length)) {
+          print("usage: seq 1 2 2 4  (segment numbers)", "err"); return;
+        }
+        stopAll(true);
+        playSequence(order);
+      }
+      break;
+
+    case "stop":
+      stopAll();
+      break;
+
+    case "cut":
+      if (needBuf()) return;
+      {
+        const i = segIdx(p[1]); if (i < 0) return;
+        if (p.length === 2) {
+          segs.splice(i, 1);
+          print("✂ deleted seg " + (i + 1) + " — " + segs.length + " remain", "warn");
+        } else {
+          const a = parseFloat(p[2]), b = parseFloat(p[3]);
+          const seg = segs[i], len = seg.end - seg.start;
+          if (isNaN(a) || isNaN(b) || a < 0 || b <= a || b > len + 0.001) {
+            print("usage: cut <n> <start> <end>  (seconds within segment, 0–" + len.toFixed(2) + ")", "err");
+            return;
+          }
+          seg.end = seg.start + b;
+          seg.start = seg.start + a;
+          print("✂ seg " + (i + 1) + " trimmed to " + seg.start.toFixed(2) + "s → " + seg.end.toFixed(2) + "s", "warn");
+        }
+      }
+      break;
+
+    case "rev": case "reverb":
+      if (needBuf()) return;
+      {
+        const i = segIdx(p[1]); if (i < 0) return;
+        let amt = p[2] !== undefined ? parseFloat(p[2]) : 0.4;
+        if (isNaN(amt) || amt < 0 || amt > 1) { print("amount must be 0–1", "err"); return; }
+        segs[i].fx.rev = amt;
+        print(amt === 0 ? "reverb removed from seg " + (i + 1) : "☼ reverb " + amt + " on seg " + (i + 1), "mag");
+      }
+      break;
+
+    case "comp": case "compress":
+      if (needBuf()) return;
+      {
+        const i = segIdx(p[1]); if (i < 0) return;
+        if (p[2] === "off" || p[2] === "0") {
+          segs[i].fx.comp = false;
+          print("compressor removed from seg " + (i + 1), "mag");
+        } else {
+          segs[i].fx.comp = true;
+          if (p[2] !== undefined) segs[i].fx.thr = parseFloat(p[2]) || -24;
+          if (p[3] !== undefined) segs[i].fx.ratio = parseFloat(p[3]) || 6;
+          print("▣ compressor on seg " + (i + 1) + "  (thr " + segs[i].fx.thr + "dB, ratio " + segs[i].fx.ratio + ":1)", "mag");
+        }
+      }
+      break;
+
+    case "key": case "pitch":
+      if (needBuf()) return;
+      {
+        const i = segIdx(p[1]); if (i < 0) return;
+        if (p[2] === undefined) { print("usage: key <n> <±semitones|note>  e.g. key 2 +3 or key 2 Eb", "err"); return; }
+        const s = parseKey(p[2]);
+        if (s === null || s < -24 || s > 24) { print("bad key — use ±semitones (-24..24) or note name C..B", "err"); return; }
+        segs[i].fx.semis = s;
+        print("♪ seg " + (i + 1) + " repitched " + (s >= 0 ? "+" : "") + s + " semitones", "mag");
+      }
+      break;
+
+    case "reset":
+      if (needBuf()) return;
+      if (p[1] === "all") {
+        segs.forEach(s => s.fx = freshFx());
+        print("fx cleared on all segments", "warn");
+      } else {
+        const i = segIdx(p[1]); if (i < 0) return;
+        segs[i].fx = freshFx();
+        print("fx cleared on seg " + (i + 1), "warn");
+      }
+      break;
+
+    case "export":
+      if (needBuf()) return;
+      { const i = segIdx(p[1]); if (i >= 0) exportSeg(i); }
+      break;
+
+    case "clear": case "cls":
+      term.innerHTML = "";
+      break;
+
+    default:
+      print("unknown command: " + cmd + "  (try 'help')", "err");
+  }
+}
+
+banner();
+</script>
+</body>
+</html>
