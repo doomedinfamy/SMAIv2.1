@@ -1,4 +1,12 @@
+"""Clarity stage: frequency pocket carving + de-muffling.
 
+1. Pocket carving — each stem gets a small boost in its own pocket and a
+   dip inside every *other* stem's pocket, so stems stop fighting for the
+   same frequencies.
+2. De-muffle — stems whose high-frequency energy ratio is too low get a
+   high-shelf boost scaled to how dull they are, plus a harmonic exciter
+   to synthesize the missing 'air'.
+"""
 
 from typing import Dict
 
